@@ -1,0 +1,1135 @@
+"""
+Robot Dashboard - Interfaz de telemetria y control via TCP
+
+  ESP32 actua como servidor TCP (SoftAP):
+      SSID:     Chrome_Robot
+      Password: chrome1234
+      IP:       
+      Puerto:   8888
+
+  Python -> ESP32 (comandos, ASCII, terminados en '\n'):
+      Trayectoria: "P,velocidad,angulo,duracion\n"
+                   ej. "P,5000,135,10\n"
+      Tara/Reset:  "R\n"
+                   El robot responde con una linea que contiene
+                   "SISTEMA DE REFERENCIA OK"; la interfaz espera esa
+                   confirmacion (con timeout) antes de reactivar botones.
+
+  ESP32 -> Python (telemetria, CSV, 50 Hz, terminado en '\n'):
+      "X,Y,Vel_Der,Vel_Izq,PWM_Der,PWM_Izq,Yaw\n"
+      PWM_Der / PWM_Izq: rango 0-4095 (resolucion de 12 bits).
+
+  Senal de finalizacion:
+      Al terminar cada tramo de trayectoria el robot manda una linea
+      unica "END\n". Si el modo de prueba tiene varios tramos (Cuadrado,
+      Dinamica), la interfaz manda automaticamente el siguiente comando
+      de la secuencia en cuanto detecta el END. Al finalizar el ultimo
+      tramo, se guarda un .xlsx con toda la telemetria de la prueba de
+      forma silenciosa (en un hilo aparte) y se reactivan los botones.
+
+Maquina de estados de la GUI (segun "Maquina de Estados y Flujos"):
+    - Calibracion: boton Tara/Home, bloquea brevemente la UI hasta
+      recibir la confirmacion del robot.
+    - Configuracion: pestanas de modo de prueba (Libre / Dinamica /
+      Cuadrado / Cartesiano), cada una habilita solo sus propios campos.
+    - Ejecucion: boton "Iniciar Trayectoria" arma la lista de comandos
+      P,... del modo seleccionado, bloquea los botones de envio y pasa
+      a modo escucha hasta agotar la secuencia.
+
+Requisitos:
+    pip install matplotlib pandas openpyxl
+
+Tkinter viene incluido con Python en Windows/macOS. En Linux puede
+requerir instalar el paquete del sistema, ej. en Debian/Ubuntu:
+    sudo apt install python3-tk
+"""
+
+import csv
+import math
+import os
+import queue
+import socket
+import threading
+import time
+from collections import deque
+from datetime import datetime
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+# ----------------------------------------------------------------------
+# Configuracion por defecto (segun ficha tecnica)
+# ----------------------------------------------------------------------
+DEFAULT_IP = "192.168.4.1"
+DEFAULT_PORT = 8888
+
+GUI_REFRESH_MS = 50       # frecuencia de drenado de la cola (~ misma que el robot, 50 Hz)
+PLOT_REFRESH_MS = 150     # frecuencia de redibujo de graficas (no hace falta a 50 Hz)
+TIME_WINDOW_POINTS = 1000  # puntos visibles en graficas de tiempo (ventana deslizante)
+
+MAP_FIXED_LIMIT_M = 2.0   # limites fijos por defecto del mapa cartesiano (+-2 m)
+
+TARE_ACK_TEXT = "SISTEMA DE REFERENCIA OK"
+TARE_TIMEOUT_MS = 5000    # espera maxima por la confirmacion del Tara
+
+# Constantes mecanicas de Chrome, usadas por el Modo Cartesiano (cinematica inversa)
+R_RUEDA_M = 0.034025
+TICKS_POR_REV = 2472.8
+TICKS_A_METROS = (2.0 * math.pi * R_RUEDA_M) / TICKS_POR_REV
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
+BG = "#1e1e2e"
+PANEL_BG = "#2a2a3c"
+FG = "#e6e6e6"
+ACCENT = "#4fc3f7"
+OK_COLOR = "#66bb6a"
+ERR_COLOR = "#ef5350"
+END_COLOR = "#ffca28"
+
+
+# ----------------------------------------------------------------------
+# Cliente TCP: corre en un hilo aparte, nunca toca la GUI directamente
+# ----------------------------------------------------------------------
+class RobotClient:
+    def __init__(self, data_queue: queue.Queue, status_callback, log_queue: queue.Queue = None,
+                 end_callback=None, tare_ack_callback=None):
+        self.sock = None
+        self.connected = False
+        self.data_queue = data_queue
+        self.status_callback = status_callback  # fn(connected: bool, msg: str)
+        self.log_queue = log_queue  # cola de lineas crudas TX/RX para el monitor serial
+        self.end_callback = end_callback  # fn() -> llamada cuando llega "END"
+        self.tare_ack_callback = tare_ack_callback  # fn() -> llamada al confirmar el Tara
+        self._recv_thread = None
+        self._stop_event = threading.Event()
+        self._buffer = ""
+
+    def _log(self, direction: str, text: str):
+        if self.log_queue is not None:
+            self.log_queue.put((time.time(), direction, text))
+
+    def connect(self, ip: str, port: int) -> bool:
+        if self.connected:
+            return True
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect((ip, port))
+            s.settimeout(None)
+            self.sock = s
+            self.connected = True
+            self._stop_event.clear()
+            self._buffer = ""
+            self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+            self._recv_thread.start()
+            self.status_callback(True, f"Conectado a {ip}:{port}")
+            return True
+        except Exception as e:
+            self.status_callback(False, f"No se pudo conectar: {e}")
+            self.sock = None
+            self.connected = False
+            return False
+
+    def disconnect(self):
+        self._stop_event.set()
+        self.connected = False
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.status_callback(False, "Desconectado")
+
+    def _recv_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                chunk = self.sock.recv(1024)
+                if not chunk:
+                    break
+                self._buffer += chunk.decode("ascii", errors="ignore")
+                # Reensamblado: solo procesamos lineas completas (terminadas en \n)
+                while "\n" in self._buffer:
+                    line, self._buffer = self._buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._log("RX", line)
+                        self._process_line(line)
+            except OSError:
+                break
+            except Exception as e:
+                print(f"[RobotClient] Error de lectura: {e}")
+                break
+
+        was_connected = self.connected
+        self.connected = False
+        if was_connected and not self._stop_event.is_set():
+            # se cayo la conexion sola (no fue un disconnect() manual)
+            self.status_callback(False, "Conexion perdida con el robot")
+
+    def _process_line(self, line: str):
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        if upper == "END":
+            self._log("END", "Trayectoria finalizada (END)")
+            if self.end_callback is not None:
+                self.end_callback()
+            return
+
+        if TARE_ACK_TEXT in upper:
+            self._log("ACK", stripped)
+            if self.tare_ack_callback is not None:
+                self.tare_ack_callback()
+            return
+
+        parts = stripped.split(",")
+        if len(parts) < 7:
+            self._log("ERR", f"Paquete incompleto ({len(parts)} campos): {line}")
+            return  # paquete incompleto/corrupto, se descarta
+        try:
+            data = {
+                "t": time.time(),
+                "x": float(parts[0]),
+                "y": float(parts[1]),
+                "vel_der": float(parts[2]),
+                "vel_izq": float(parts[3]),
+                "pwm_der": int(float(parts[4])),
+                "pwm_izq": int(float(parts[5])),
+                "yaw": float(parts[6]),
+                "us": float(parts[7]) if len(parts) > 7 else None,
+            }
+        except ValueError:
+            self._log("ERR", f"Campo no numerico: {line}")
+            return  # campo no numerico, se descarta la linea
+        self.data_queue.put(data)
+
+    def send_command(self, cmd: str) -> bool:
+        if not self.connected or not self.sock:
+            return False
+        try:
+            self.sock.sendall((cmd + "\n").encode("ascii"))
+            self._log("TX", cmd)
+            return True
+        except Exception as e:
+            self.status_callback(self.connected, f"Error enviando comando: {e}")
+            self._log("ERR", f"Fallo enviando '{cmd}': {e}")
+            return False
+
+
+# ----------------------------------------------------------------------
+# GUI principal
+# ----------------------------------------------------------------------
+class RobotDashboard(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Robot Dashboard - Telemetria y Control")
+        self.geometry("1420x800")
+        self.configure(bg=BG)
+        self.minsize(1100, 680)
+
+        self.trajectory_active = False
+        self.tara_waiting = False
+        self._tara_token = 0
+
+        # Estado de la secuencia de comandos en ejecucion (modo Dinamica/Cuadrado
+        # mandan varios comandos P encadenados por la senal END)
+        self.command_sequence = deque()
+        self.sequence_total = 0
+        self.sequence_base_name = "Prueba"
+        self.sequence_log = []
+        self.sequence_time_ms = 0
+
+        self.data_queue = queue.Queue()
+        self.log_queue = queue.Queue()
+        self.client = RobotClient(self.data_queue, self._on_status_change, self.log_queue,
+                                   self._on_trajectory_end, self._on_tare_ack)
+
+        # Historiales para graficas
+        self.traj_x = []
+        self.traj_y = []
+        self.t0 = None
+        self.time_hist = deque(maxlen=TIME_WINDOW_POINTS)
+        self.veld_hist = deque(maxlen=TIME_WINDOW_POINTS)
+        self.veli_hist = deque(maxlen=TIME_WINDOW_POINTS)
+        self.yaw_hist = deque(maxlen=TIME_WINDOW_POINTS)
+        self.setpoint_yaw = None  # angulo objetivo del tramo actual
+        self.setpoint_vel = None  # velocidad objetivo del tramo actual
+
+        self.last_data = None
+        self._setup_style()
+        self._build_layout()
+
+        self.after(GUI_REFRESH_MS, self._drain_queue)
+        self.after(GUI_REFRESH_MS, self._drain_log_queue)
+        self.after(PLOT_REFRESH_MS, self._refresh_plots)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        pandas_note = "" if PANDAS_AVAILABLE else "  (!) pandas/openpyxl no instalados, no se podra exportar"
+        self.log_queue.put((time.time(), "END", f"Los .xlsx se guardaran en: {LOG_DIR}{pandas_note}"))
+
+    # ------------------------------------------------------------------
+    # Estilo
+    # ------------------------------------------------------------------
+    def _setup_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TFrame", background=PANEL_BG)
+        style.configure("TLabel", background=PANEL_BG, foreground=FG, font=("Segoe UI", 10))
+        style.configure("Title.TLabel", background=PANEL_BG, foreground=ACCENT, font=("Segoe UI", 12, "bold"))
+        style.configure("Value.TLabel", background=PANEL_BG, foreground=FG, font=("Consolas", 16, "bold"))
+        style.configure("Unit.TLabel", background=PANEL_BG, foreground="#9e9e9e", font=("Segoe UI", 8))
+        style.configure("TButton", font=("Segoe UI", 10), padding=6)
+        style.configure("TEntry", padding=4)
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 6), font=("Segoe UI", 10))
+
+    # ------------------------------------------------------------------
+    # Layout general
+    # ------------------------------------------------------------------
+    def _build_layout(self):
+        # ---- Barra superior: conexion ----
+        top = tk.Frame(self, bg=PANEL_BG, padx=10, pady=8)
+        top.pack(side="top", fill="x")
+        self._build_connection_bar(top)
+
+        # ---- Cuerpo: panel izquierdo (telemetria + comandos) / derecho (graficas) ----
+        body = tk.Frame(self, bg=BG)
+        body.pack(side="top", fill="both", expand=True, padx=8, pady=8)
+
+        left = tk.Frame(body, bg=BG, width=460)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        left.pack_propagate(False)
+
+        right = tk.Frame(body, bg=BG)
+        right.pack(side="left", fill="both", expand=True)
+
+        self._build_telemetry_panel(left)
+        self._build_command_panel(left)
+        self._build_monitor_panel(left)
+        self._build_plots(right)
+
+    # ------------------------------------------------------------------
+    # Barra de conexion
+    # ------------------------------------------------------------------
+    def _build_connection_bar(self, parent):
+        tk.Label(parent, text="IP:", bg=PANEL_BG, fg=FG).pack(side="left")
+        self.ip_var = tk.StringVar(value=DEFAULT_IP)
+        ttk.Entry(parent, textvariable=self.ip_var, width=14).pack(side="left", padx=(4, 10))
+
+        tk.Label(parent, text="Puerto:", bg=PANEL_BG, fg=FG).pack(side="left")
+        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
+        ttk.Entry(parent, textvariable=self.port_var, width=7).pack(side="left", padx=(4, 10))
+
+        self.connect_btn = ttk.Button(parent, text="Conectar", command=self._toggle_connection)
+        self.connect_btn.pack(side="left", padx=(0, 14))
+
+        self.status_dot = tk.Canvas(parent, width=14, height=14, bg=PANEL_BG, highlightthickness=0)
+        self.status_dot.pack(side="left")
+        self._dot = self.status_dot.create_oval(2, 2, 12, 12, fill=ERR_COLOR, outline="")
+
+        self.status_label = tk.Label(parent, text="Desconectado", bg=PANEL_BG, fg=FG)
+        self.status_label.pack(side="left", padx=(6, 0))
+
+    def _toggle_connection(self):
+        if self.client.connected:
+            self.client.disconnect()
+            self.connect_btn.config(text="Conectar")
+            self._set_trajectory_active(False)
+            self._set_tara_waiting(False)
+            return
+        ip = self.ip_var.get().strip()
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Puerto invalido", "El puerto debe ser un numero entero.")
+            return
+
+        self.connect_btn.config(text="Conectando...", state="disabled")
+        self.update_idletasks()
+
+        def worker():
+            ok = self.client.connect(ip, port)
+            self.after(0, lambda: self._post_connect_ui(ok))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _post_connect_ui(self, ok: bool):
+        self.connect_btn.config(state="normal")
+        self.connect_btn.config(text="Desconectar" if ok else "Conectar")
+        if ok:
+            self.t0 = None  # reinicia el eje de tiempo de las graficas
+
+    def _on_status_change(self, connected: bool, msg: str):
+        # Puede llamarse desde el hilo de red -> siempre via .after()
+        def update():
+            self.status_label.config(text=msg)
+            self.status_dot.itemconfig(self._dot, fill=OK_COLOR if connected else ERR_COLOR)
+            if not connected:
+                self.connect_btn.config(text="Conectar")
+        self.after(0, update)
+
+    # ------------------------------------------------------------------
+    # Panel de telemetria
+    # ------------------------------------------------------------------
+    def _build_telemetry_panel(self, parent):
+        frame = tk.Frame(parent, bg=PANEL_BG, padx=12, pady=10)
+        frame.pack(side="top", fill="x")
+
+        ttk.Label(frame, text="TELEMETRIA", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        fields = [
+            ("x", "Pos. X", "m"),
+            ("y", "Pos. Y", "m"),
+            ("vel_der", "Vel. Derecha", "ticks/s"),
+            ("vel_izq", "Vel. Izquierda", "ticks/s"),
+            ("pwm_der", "PWM Derecho", "0-4095"),
+            ("pwm_izq", "PWM Izquierdo", "0-4095"),
+            ("yaw", "Yaw (IMU)", "deg"),
+            ("us", "Distancia US", "cm"),
+        ]
+        self.value_labels = {}
+        for i, (key, label, unit) in enumerate(fields):
+            r = i + 1
+            ttk.Label(frame, text=label).grid(row=r, column=0, sticky="w", pady=3)
+            val_lbl = ttk.Label(frame, text="--", style="Value.TLabel")
+            val_lbl.grid(row=r, column=1, sticky="e", pady=3)
+            unit_lbl = ttk.Label(frame, text=unit, style="Unit.TLabel")
+            unit_lbl.grid(row=r, column=2, sticky="w", padx=(4, 0))
+            self.value_labels[key] = val_lbl
+
+        frame.columnconfigure(1, weight=1)
+
+        self.last_update_lbl = ttk.Label(frame, text="Ultimo paquete: --", style="Unit.TLabel")
+        self.last_update_lbl.grid(row=len(fields) + 1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    # ------------------------------------------------------------------
+    # Panel de comandos: maquina de estados con 4 modos de prueba
+    # ------------------------------------------------------------------
+    def _build_command_panel(self, parent):
+        frame = tk.Frame(parent, bg=PANEL_BG, padx=12, pady=10)
+        frame.pack(side="top", fill="x", pady=(10, 0))
+
+        ttk.Label(frame, text="CONFIGURACION DE PRUEBA", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+
+        self.mode_notebook = ttk.Notebook(frame)
+        self.mode_notebook.pack(fill="x")
+
+        self._build_mode_libre(self.mode_notebook)
+        self._build_mode_dinamica(self.mode_notebook)
+        self._build_mode_cuadrado(self.mode_notebook)
+        self._build_mode_cartesiano(self.mode_notebook)
+
+        self.start_test_btn = ttk.Button(frame, text="Iniciar Trayectoria", command=self._start_test)
+        self.start_test_btn.pack(fill="x", pady=(10, 4))
+
+        self.trajectory_status_lbl = ttk.Label(frame, text="", style="Unit.TLabel")
+        self.trajectory_status_lbl.pack(anchor="w", pady=(2, 0))
+
+        ttk.Separator(frame, orient="horizontal").pack(fill="x", pady=10)
+
+        ttk.Label(frame, text="OTROS COMANDOS", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+
+        self.tare_btn = ttk.Button(frame, text="Actualizar Ejes", command=self._send_r_command)
+        self.tare_btn.pack(fill="x", pady=4)
+
+        ttk.Label(frame, text="Comando crudo:").pack(anchor="w", pady=(8, 2))
+        raw_row = tk.Frame(frame, bg=PANEL_BG)
+        raw_row.pack(fill="x")
+        self.raw_cmd_var = tk.StringVar()
+        raw_entry = ttk.Entry(raw_row, textvariable=self.raw_cmd_var)
+        raw_entry.pack(side="left", fill="x", expand=True)
+        raw_entry.bind("<Return>", lambda e: self._send_raw_command())
+        ttk.Button(raw_row, text="Enviar", command=self._send_raw_command, width=8).pack(side="left", padx=(6, 0))
+
+        self.last_cmd_lbl = ttk.Label(frame, text="Ultimo comando: --", style="Unit.TLabel", wraplength=400)
+        self.last_cmd_lbl.pack(anchor="w", pady=(8, 0))
+
+    def _build_mode_libre(self, notebook):
+        tab = ttk.Frame(notebook, padding=10)
+        notebook.add(tab, text="Libre")
+
+        ttk.Label(tab, text="Velocidad (ticks/s)").grid(row=0, column=0, sticky="w", pady=3)
+        self.vel_var = tk.StringVar(value="5000")
+        ttk.Entry(tab, textvariable=self.vel_var, width=12).grid(row=0, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Angulo (deg, global)").grid(row=1, column=0, sticky="w", pady=3)
+        self.ang_var = tk.StringVar(value="45")
+        ttk.Entry(tab, textvariable=self.ang_var, width=12).grid(row=1, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Duracion (s)").grid(row=2, column=0, sticky="w", pady=3)
+        self.dur_var = tk.StringVar(value="10")
+        ttk.Entry(tab, textvariable=self.dur_var, width=12).grid(row=2, column=1, sticky="e", pady=3)
+        tab.columnconfigure(1, weight=1)
+
+    def _build_mode_dinamica(self, notebook):
+        tab = ttk.Frame(notebook, padding=10)
+        notebook.add(tab, text="Dinamica")
+
+        ttk.Label(tab, text="Velocidad 1 (ticks/s)").grid(row=0, column=0, sticky="w", pady=3)
+        self.din_v1_var = tk.StringVar(value="2000")
+        ttk.Entry(tab, textvariable=self.din_v1_var, width=12).grid(row=0, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Velocidad 2 (ticks/s)").grid(row=1, column=0, sticky="w", pady=3)
+        self.din_v2_var = tk.StringVar(value="5000")
+        ttk.Entry(tab, textvariable=self.din_v2_var, width=12).grid(row=1, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Velocidad 3 (ticks/s)").grid(row=2, column=0, sticky="w", pady=3)
+        self.din_v3_var = tk.StringVar(value="3000")
+        ttk.Entry(tab, textvariable=self.din_v3_var, width=12).grid(row=2, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Angulo constante (deg)").grid(row=3, column=0, sticky="w", pady=3)
+        self.din_ang_var = tk.StringVar(value="90")
+        ttk.Entry(tab, textvariable=self.din_ang_var, width=12).grid(row=3, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Duracion total (s)").grid(row=4, column=0, sticky="w", pady=3)
+        self.din_dur_var = tk.StringVar(value="6")
+        ttk.Entry(tab, textvariable=self.din_dur_var, width=12).grid(row=4, column=1, sticky="e", pady=3)
+        tab.columnconfigure(1, weight=1)
+
+        ttk.Label(tab, text="El tiempo se reparte entre los 3 tramos.",
+                  style="Unit.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _build_mode_cuadrado(self, notebook):
+        tab = ttk.Frame(notebook, padding=10)
+        notebook.add(tab, text="Cuadrado")
+
+        ttk.Label(tab, text="Velocidad de crucero (ticks/s)").grid(row=0, column=0, sticky="w", pady=3)
+        self.cuad_vel_var = tk.StringVar(value="4000")
+        ttk.Entry(tab, textvariable=self.cuad_vel_var, width=12).grid(row=0, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Tiempo por lado (s)").grid(row=1, column=0, sticky="w", pady=3)
+        self.cuad_tlado_var = tk.StringVar(value="3")
+        ttk.Entry(tab, textvariable=self.cuad_tlado_var, width=12).grid(row=1, column=1, sticky="e", pady=3)
+        tab.columnconfigure(1, weight=1)
+
+        ttk.Label(tab, text="Arma automaticamente los 5 tramos del\ncuadrado (giro horario).",
+                  style="Unit.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    def _build_mode_cartesiano(self, notebook):
+        tab = ttk.Frame(notebook, padding=10)
+        notebook.add(tab, text="Cartesiano")
+
+        ttk.Label(tab, text="Desplazamiento X (m)").grid(row=0, column=0, sticky="w", pady=3)
+        self.cart_dx_var = tk.StringVar(value="1.0")
+        ttk.Entry(tab, textvariable=self.cart_dx_var, width=12).grid(row=0, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Desplazamiento Y (m)").grid(row=1, column=0, sticky="w", pady=3)
+        self.cart_dy_var = tk.StringVar(value="1.0")
+        ttk.Entry(tab, textvariable=self.cart_dy_var, width=12).grid(row=1, column=1, sticky="e", pady=3)
+
+        ttk.Label(tab, text="Velocidad de crucero (ticks/s)").grid(row=2, column=0, sticky="w", pady=3)
+        self.cart_vel_var = tk.StringVar(value="4000")
+        ttk.Entry(tab, textvariable=self.cart_vel_var, width=12).grid(row=2, column=1, sticky="e", pady=3)
+        tab.columnconfigure(1, weight=1)
+
+        self.cart_preview_lbl = ttk.Label(tab, text="", style="Unit.TLabel", wraplength=380)
+        self.cart_preview_lbl.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+    # ------------------------------------------------------------------
+    def _require_connection(self) -> bool:
+        if not self.client.connected:
+            messagebox.showwarning("Sin conexion", "Primero conecta con el robot.")
+            return False
+        return True
+
+    def _parse_fields(self, specs):
+        """specs: lista de (StringVar, nombre_campo). Devuelve lista de floats
+        o None si algun campo es invalido (mostrando un solo dialogo de error)."""
+        values = []
+        for var, name in specs:
+            try:
+                values.append(float(var.get()))
+            except ValueError:
+                messagebox.showerror("Datos invalidos", f"'{name}' debe ser numerico.")
+                return None
+        return values
+
+    # ------------------------------------------------------------------
+    # Estado de Ejecucion: arma la lista de comandos segun el modo activo
+    # ------------------------------------------------------------------
+    def _start_test(self):
+        if not self._require_connection():
+            return
+        if self.trajectory_active:
+            messagebox.showwarning("Prueba en curso", "Espera a que termine la prueba actual.")
+            return
+        if self.tara_waiting:
+            messagebox.showwarning("Tarea en curso", "Espera la confirmacion del Tarea antes de iniciar.")
+            return
+
+        mode_idx = self.mode_notebook.index(self.mode_notebook.select())
+        builder = (self._build_commands_libre, self._build_commands_dinamica,
+                   self._build_commands_cuadrado, self._build_commands_cartesiano)[mode_idx]
+        result = builder()
+        if result is None:
+            return  # error de validacion ya mostrado al usuario
+        commands, base_name = result
+        self._start_sequence(commands, base_name)
+
+    def _build_commands_libre(self):
+        vals = self._parse_fields([(self.vel_var, "Velocidad"), (self.ang_var, "Angulo"), (self.dur_var, "Duracion")])
+        if vals is None:
+            return None
+        vel, ang, dur = vals
+        return [f"P,{vel:g},{ang:g},{dur:g}"], "Prueba_Libre"
+
+    def _build_commands_dinamica(self):
+        vals = self._parse_fields([
+            (self.din_v1_var, "Velocidad 1"), (self.din_v2_var, "Velocidad 2"),
+            (self.din_v3_var, "Velocidad 3"), (self.din_ang_var, "Angulo constante"),
+            (self.din_dur_var, "Duracion total"),
+        ])
+        if vals is None:
+            return None
+        v1, v2, v3, ang, dur_total = vals
+        t_tramo = dur_total / 3.0
+        commands = [f"P,{v:g},{ang:g},{t_tramo:g}" for v in (v1, v2, v3)]
+        return commands, "Prueba_Dinamica"
+
+    def _build_commands_cuadrado(self):
+        vals = self._parse_fields([(self.cuad_vel_var, "Velocidad de crucero"), (self.cuad_tlado_var, "Tiempo por lado")])
+        if vals is None:
+            return None
+        sp, t_lado = vals
+        # Secuencia para trazar un cuadrado continuo a la derecha (horario)
+        commands = [
+            f"P,{sp:g},90,{t_lado:g}",     # Lado 1: hacia adelante (Y+)
+            f"P,{sp:g},0,{t_lado:g}",      # Lado 2: gira 90 der (X+)
+            f"P,{sp:g},-90,{t_lado:g}",    # Lado 3: gira 90 der (Y-)
+            f"P,{sp:g},-180,{t_lado:g}",   # Lado 4: gira 90 der (X-)
+            "P,0,-270,2",                   # Extra: gira 90 der para volver al frente
+        ]
+        return commands, "Prueba_Cuadrado_Der"
+
+    def _build_commands_cartesiano(self):
+        vals = self._parse_fields([
+            (self.cart_dx_var, "Desplazamiento X"), (self.cart_dy_var, "Desplazamiento Y"),
+            (self.cart_vel_var, "Velocidad de crucero"),
+        ])
+        if vals is None:
+            return None
+        dx, dy, sp = vals
+        if sp == 0:
+            messagebox.showerror("Datos invalidos", "La velocidad de crucero no puede ser 0.")
+            return None
+
+        distancia_m = math.sqrt(dx ** 2 + dy ** 2)
+        angulo_deg = math.degrees(math.atan2(dy, dx))
+        vel_m_s = sp * TICKS_A_METROS
+        duracion = distancia_m / vel_m_s
+
+        self.cart_preview_lbl.config(
+            text=(f"Distancia: {distancia_m:.3f} m  |  Angulo: {angulo_deg:.2f}deg  |  "
+                  f"Tiempo: {duracion:.2f} s")
+        )
+        commands = [f"P,{int(sp)},{angulo_deg:.2f},{duracion:.3f}"]
+        return commands, "Trayectoria_Cartesiana"
+
+    # ------------------------------------------------------------------
+    # Secuencia de comandos encadenados por la senal END
+    # ------------------------------------------------------------------
+    def _start_sequence(self, commands, base_name):
+        self.command_sequence = deque(commands)
+        self.sequence_total = len(commands)
+        self.sequence_base_name = base_name
+        self.sequence_log = []
+        self.sequence_time_ms = 0
+        self._set_trajectory_active(True)
+        self._send_next_in_sequence()
+
+    def _send_next_in_sequence(self):
+        if not self.command_sequence:
+            self._finish_sequence()
+            return
+        cmd = self.command_sequence.popleft()
+        done = self.sequence_total - len(self.command_sequence)
+        if self.client.send_command(cmd):
+            self.last_cmd_lbl.config(text=f"Ultimo comando: {cmd}")
+            parts = cmd.split(",")
+            if len(parts) >= 3:
+                try:
+                    self.setpoint_vel = float(parts[1])
+                    self.setpoint_yaw = float(parts[2])
+                except ValueError:
+                    pass
+            self.trajectory_status_lbl.config(
+                text=f"Tramo {done}/{self.sequence_total} en curso... esperando END",
+                foreground=ACCENT,
+            )
+        else:
+            # fallo el envio (p.ej. se perdio la conexion a media secuencia)
+            messagebox.showerror("Error de envio", f"No se pudo enviar el comando: {cmd}")
+            self.command_sequence.clear()
+            self._finish_sequence(save_excel=bool(self.sequence_log))
+
+    def _on_trajectory_end(self):
+        # Se llama desde el hilo de red -> siempre via .after()
+        def update():
+            if not self.trajectory_active:
+                return  # END fuera de una secuencia activa, se ignora
+            if self.command_sequence:
+                self._send_next_in_sequence()
+            else:
+                self._finish_sequence()
+        self.after(0, update)
+
+    def _finish_sequence(self, save_excel: bool = True):
+        self._set_trajectory_active(False)
+        if save_excel and self.sequence_log:
+            self.trajectory_status_lbl.config(text="Secuencia finalizada, guardando Excel...", foreground=OK_COLOR)
+            log_copy = list(self.sequence_log)
+            base_name = self.sequence_base_name
+            self.sequence_log = []
+            threading.Thread(target=self._save_excel_background, args=(log_copy, base_name), daemon=True).start()
+        elif save_excel:
+            # La secuencia termino pero no se acumulo ninguna fila de telemetria
+            # (posible perdida de datos o el robot no envio CSV durante la prueba)
+            self.trajectory_status_lbl.config(text="Secuencia finalizada, SIN datos que guardar", foreground=ERR_COLOR)
+            messagebox.showwarning(
+                "Sin telemetria",
+                "La secuencia termino pero no se recibio ningun paquete de telemetria durante la prueba,"
+                " asi que no se genero ningun Excel. Revisa la conexion y que el robot este transmitiendo."
+            )
+        else:
+            self.trajectory_status_lbl.config(text="Secuencia finalizada (END)", foreground=OK_COLOR)
+
+    def _save_excel_background(self, log_rows, base_name):
+        if not PANDAS_AVAILABLE:
+            self.after(0, lambda: self._on_excel_error(
+                "Falta instalar pandas y openpyxl. Corre: pip install pandas openpyxl"))
+            return
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            timestamp = time.strftime("%H%M%S")
+            filename = os.path.join(LOG_DIR, f"{base_name}_{timestamp}.xlsx")
+            df = pd.DataFrame(log_rows)
+            df.to_excel(filename, index=False)
+            self.after(0, lambda: self._on_excel_saved(filename))
+        except Exception as e:
+            self.after(0, lambda: self._on_excel_error(str(e)))
+
+    def _on_excel_saved(self, filename):
+        self.trajectory_status_lbl.config(text=f"Excel guardado: {os.path.basename(filename)}", foreground=OK_COLOR)
+        if self.log_queue is not None:
+            self.log_queue.put((time.time(), "END", f"Excel guardado en {filename}"))
+        messagebox.showinfo("Excel guardado", f"Se guardo la telemetria de la prueba en:\n\n{filename}")
+
+    def _on_excel_error(self, msg):
+        self.trajectory_status_lbl.config(text="Error guardando Excel (ver monitor)", foreground=ERR_COLOR)
+        if self.log_queue is not None:
+            self.log_queue.put((time.time(), "ERR", f"No se pudo guardar el Excel: {msg}"))
+        messagebox.showerror("Error al guardar Excel", msg)
+
+    # ------------------------------------------------------------------
+    # Estado de Calibracion (Tara/Home) con espera de confirmacion
+    # ------------------------------------------------------------------
+    def _send_r_command(self):
+        if not self._require_connection():
+            return
+        if self.trajectory_active:
+            messagebox.showwarning("Prueba en curso", "Espera a que termine la prueba actual antes de tarar.")
+            return
+        self._tara_token += 1
+        token = self._tara_token
+        if self.client.send_command("R"):
+            self.last_cmd_lbl.config(text="Ultimo comando: R (tara/home)")
+            self.setpoint_yaw = 90.0
+            self._set_tara_waiting(True)
+            self.after(TARE_TIMEOUT_MS, lambda: self._check_tara_timeout(token))
+
+    def _set_tara_waiting(self, waiting: bool):
+        self.tara_waiting = waiting
+        state = "disabled" if waiting else "normal"
+        self.tare_btn.config(state=state)
+        if not self.trajectory_active:
+            self.start_test_btn.config(state=state)
+        if waiting:
+            self.trajectory_status_lbl.config(text="Esperando confirmacion de tara...", foreground=ACCENT)
+        elif not self.trajectory_active:
+            self.trajectory_status_lbl.config(text="")
+
+    def _on_tare_ack(self):
+        # Se llama desde el hilo de red -> siempre via .after()
+        def update():
+            if self.tara_waiting:
+                self._set_tara_waiting(False)
+                self.trajectory_status_lbl.config(text="Sistema de referencia OK", foreground=OK_COLOR)
+        self.after(0, update)
+
+    def _check_tara_timeout(self, token):
+        if self.tara_waiting and token == self._tara_token:
+            self._set_tara_waiting(False)
+            self.trajectory_status_lbl.config(text="Sin confirmacion del robot (timeout)", foreground=ERR_COLOR)
+
+    def _send_raw_command(self):
+        if not self._require_connection():
+            return
+        cmd = self.raw_cmd_var.get().strip()
+        if not cmd:
+            return
+        if self.client.send_command(cmd):
+            self.last_cmd_lbl.config(text=f"Ultimo comando: {cmd}")
+            self.raw_cmd_var.set("")
+
+    def _set_trajectory_active(self, active: bool):
+        """Deshabilita/habilita los botones de envio mientras el robot
+        esta ejecutando una prueba (entre el primer comando P y el
+        agotamiento de la secuencia via senales END)."""
+        self.trajectory_active = active
+        state = "disabled" if active else "normal"
+        self.start_test_btn.config(state=state)
+        self.tare_btn.config(state=state)
+        if active:
+            self.trajectory_status_lbl.config(text="Prueba en curso... esperando END", foreground=ACCENT)
+        else:
+            self.trajectory_status_lbl.config(text="")
+
+    # ------------------------------------------------------------------
+    # Panel de monitor serial (consola TX/RX cruda)
+    # ------------------------------------------------------------------
+    def _build_monitor_panel(self, parent):
+        frame = tk.Frame(parent, bg=PANEL_BG, padx=12, pady=10)
+        frame.pack(side="top", fill="both", expand=True, pady=(10, 0))
+
+        header = tk.Frame(frame, bg=PANEL_BG)
+        header.pack(side="top", fill="x")
+        ttk.Label(header, text="MONITOR SERIAL", style="Title.TLabel").pack(side="left")
+
+        self.autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(header, text="Auto-scroll", variable=self.autoscroll_var).pack(side="right")
+
+        self.pause_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Pausar", variable=self.pause_var).pack(side="right", padx=(0, 10))
+
+        text_frame = tk.Frame(frame, bg=PANEL_BG)
+        text_frame.pack(side="top", fill="both", expand=True, pady=(8, 6))
+        text_frame.grid_rowconfigure(0, weight=1)
+        text_frame.grid_columnconfigure(0, weight=1)
+
+        self.monitor_text = tk.Text(
+            text_frame,
+            height=14,
+            width=60,
+            bg="#11111c",
+            fg="#d4d4d4",
+            insertbackground=FG,
+            font=("Consolas", 9),
+            wrap="none",
+            state="disabled",
+            relief="flat",
+        )
+        self.monitor_text.grid(row=0, column=0, sticky="nsew")
+
+        v_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.monitor_text.yview)
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.monitor_text.xview)
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        self.monitor_text.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        # Colores por tipo de linea
+        self.monitor_text.tag_config("tx", foreground="#42a5f5")
+        self.monitor_text.tag_config("rx", foreground="#66bb6a")
+        self.monitor_text.tag_config("err", foreground="#ef5350")
+        self.monitor_text.tag_config("end", foreground=END_COLOR)
+        self.monitor_text.tag_config("ack", foreground="#ba68c8")
+        self.monitor_text.tag_config("ts", foreground="#777777")
+
+        btns = tk.Frame(frame, bg=PANEL_BG)
+        btns.pack(side="top", fill="x")
+        ttk.Button(btns, text="Limpiar monitor", command=self._clear_monitor).pack(side="left")
+        ttk.Button(btns, text="Guardar log...", command=self._save_monitor_log).pack(side="left", padx=(8, 0))
+
+        self._monitor_lines = []  # buffer paralelo para "Guardar log..."
+
+    def _drain_log_queue(self):
+        new_entries = []
+        try:
+            while True:
+                new_entries.append(self.log_queue.get_nowait())
+        except queue.Empty:
+            pass
+
+        if new_entries and not self.pause_var.get():
+            self.monitor_text.config(state="normal")
+            for ts, direction, text in new_entries:
+                tag = {"TX": "tx", "RX": "rx", "ERR": "err", "END": "end", "ACK": "ack"}.get(direction, "rx")
+                prefix = {"TX": ">> ", "RX": "<< ", "ERR": "!! ", "END": "== ", "ACK": "** "}.get(direction, "")
+                t_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+                line = f"[{t_str}] {prefix}{text}\n"
+                self._monitor_lines.append(line)
+                self.monitor_text.insert("end", f"[{t_str}] ", "ts")
+                self.monitor_text.insert("end", f"{prefix}{text}\n", tag)
+
+            # limita el historial visible para no consumir memoria/CPU sin fin
+            max_lines = 1000
+            line_count = int(self.monitor_text.index("end-1c").split(".")[0])
+            if line_count > max_lines:
+                self.monitor_text.delete("1.0", f"{line_count - max_lines}.0")
+            if len(self._monitor_lines) > max_lines:
+                self._monitor_lines = self._monitor_lines[-max_lines:]
+
+            if self.autoscroll_var.get():
+                self.monitor_text.see("end")
+            self.monitor_text.config(state="disabled")
+
+        self.after(GUI_REFRESH_MS, self._drain_log_queue)
+
+    def _clear_monitor(self):
+        self.monitor_text.config(state="normal")
+        self.monitor_text.delete("1.0", "end")
+        self.monitor_text.config(state="disabled")
+        self._monitor_lines.clear()
+
+    def _save_monitor_log(self):
+        if not self._monitor_lines:
+            messagebox.showinfo("Sin datos", "El monitor esta vacio.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Guardar log del monitor",
+            initialfile=f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            defaultextension=".txt",
+            filetypes=[("Texto", "*.txt")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(self._monitor_lines)
+            messagebox.showinfo("Guardado", f"Log guardado en:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error al guardar", str(e))
+
+
+    def _build_plots(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="both", expand=True)
+
+        # ---- Tab 1: trayectoria 2D ----
+        traj_tab = tk.Frame(notebook, bg=BG)
+        notebook.add(traj_tab, text="Trayectoria (X-Y)")
+
+        self.fig_traj = Figure(figsize=(5, 5), dpi=100, facecolor=BG)
+        self.ax_traj = self.fig_traj.add_subplot(111)
+        self._style_axes(self.ax_traj, "Trayectoria del robot", "X (m)", "Y (m)")
+        self.ax_traj.set_aspect("equal", adjustable="box")
+        self.ax_traj.set_xlim(-MAP_FIXED_LIMIT_M, MAP_FIXED_LIMIT_M)
+        self.ax_traj.set_ylim(-MAP_FIXED_LIMIT_M, MAP_FIXED_LIMIT_M)
+        (self.traj_line,) = self.ax_traj.plot([], [], color=ACCENT, linewidth=1.6, label="Trayectoria")
+        (self.traj_point,) = self.ax_traj.plot([], [], "o", color=OK_COLOR, markersize=8, label="Posicion actual")
+        self.ax_traj.legend(loc="upper right", facecolor=PANEL_BG, labelcolor=FG, fontsize=8)
+
+        self.canvas_traj = FigureCanvasTkAgg(self.fig_traj, master=traj_tab)
+        self.canvas_traj.get_tk_widget().pack(fill="both", expand=True)
+
+        traj_btns = tk.Frame(traj_tab, bg=BG)
+        traj_btns.pack(side="bottom", fill="x", pady=6)
+        ttk.Button(traj_btns, text="Guardar mapa", command=self._save_map).pack(side="left", padx=6)
+        ttk.Button(traj_btns, text="Borrar mapa", command=self._clear_map).pack(side="left", padx=6)
+        self.map_autoscale_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(traj_btns, text="Auto-ajustar zoom", variable=self.map_autoscale_var).pack(side="left", padx=12)
+
+        # ---- Tab 2: velocidad y yaw vs tiempo ----
+        time_tab = tk.Frame(notebook, bg=BG)
+        notebook.add(time_tab, text="Velocidad / Yaw vs Tiempo")
+
+        self.fig_time = Figure(figsize=(5, 5), dpi=100, facecolor=BG)
+        self.ax_vel = self.fig_time.add_subplot(211)
+        self.ax_yaw = self.fig_time.add_subplot(212)
+        self._style_axes(self.ax_vel, "Velocidad de ruedas", "t (ms)", "ticks/s")
+        self._style_axes(self.ax_yaw, "Orientacion (Yaw)", "t (ms)", "deg")
+        self.fig_time.tight_layout(pad=2.5)
+
+        (self.line_veld,) = self.ax_vel.plot([], [], color="#ef5350", linewidth=1.3, label="Vel. Der")
+        (self.line_veli,) = self.ax_vel.plot([], [], color="#42a5f5", linewidth=1.3, label="Vel. Izq")
+        (self.line_velsp,) = self.ax_vel.plot([], [], color="#9e9e9e", linewidth=1, linestyle="--", label="Setpoint")
+        self.ax_vel.legend(loc="upper right", facecolor=PANEL_BG, labelcolor=FG, fontsize=8)
+
+        (self.line_yaw,) = self.ax_yaw.plot([], [], color=ACCENT, linewidth=1.3, label="Yaw")
+        (self.line_yawsp,) = self.ax_yaw.plot([], [], color="#9e9e9e", linewidth=1, linestyle="--", label="Setpoint")
+        self.ax_yaw.legend(loc="upper right", facecolor=PANEL_BG, labelcolor=FG, fontsize=8)
+
+        self.canvas_time = FigureCanvasTkAgg(self.fig_time, master=time_tab)
+        self.canvas_time.get_tk_widget().pack(fill="both", expand=True)
+
+    def _style_axes(self, ax, title, xlabel, ylabel):
+        ax.set_facecolor(PANEL_BG)
+        ax.set_title(title, color=FG, fontsize=10)
+        ax.set_xlabel(xlabel, color=FG, fontsize=8)
+        ax.set_ylabel(ylabel, color=FG, fontsize=8)
+        ax.tick_params(colors=FG, labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color("#555")
+        ax.grid(True, color="#444", linewidth=0.5, alpha=0.5)
+
+    # ------------------------------------------------------------------
+    # Drenado de la cola de datos (corre en el hilo principal de la GUI)
+    # ------------------------------------------------------------------
+    def _drain_queue(self):
+        latest = None
+        drained = 0
+        try:
+            while True:
+                data = self.data_queue.get_nowait()
+                latest = data
+                drained += 1
+                if self.t0 is None:
+                    self.t0 = data["t"]
+                self.traj_x.append(data["x"])
+                self.traj_y.append(data["y"])
+                self.time_hist.append((data["t"] - self.t0) * 1000.0)
+                self.veld_hist.append(data["vel_der"])
+                self.veli_hist.append(data["vel_izq"])
+                self.yaw_hist.append(data["yaw"])
+
+                if self.trajectory_active:
+                    self.sequence_log.append({
+                        "Tiempo (ms)": self.sequence_time_ms,
+                        "Pos X (m)": data["x"],
+                        "Pos Y (m)": data["y"],
+                        "Vel Der": data["vel_der"],
+                        "PWM_Der": data["pwm_der"],
+                        "Vel Izq": data["vel_izq"],
+                        "PWM_Izq": data["pwm_izq"],
+                        "Theta (°)": data["yaw"],
+                    })
+                    self.sequence_time_ms += 20
+        except queue.Empty:
+            pass
+
+        if latest is not None:
+            self.last_data = latest
+            self._update_telemetry_labels(latest)
+
+        self.after(GUI_REFRESH_MS, self._drain_queue)
+
+    def _update_telemetry_labels(self, data):
+        self.value_labels["x"].config(text=f"{data['x']:.3f}")
+        self.value_labels["y"].config(text=f"{data['y']:.3f}")
+        self.value_labels["vel_der"].config(text=f"{data['vel_der']:.2f}")
+        self.value_labels["vel_izq"].config(text=f"{data['vel_izq']:.2f}")
+        self.value_labels["pwm_der"].config(text=str(data["pwm_der"]))
+        self.value_labels["pwm_izq"].config(text=str(data["pwm_izq"]))
+        self.value_labels["yaw"].config(text=f"{data['yaw']:.2f}")
+        self.value_labels["us"].config(text=f"{data['us']:.1f}" if data["us"] is not None else "N/A")
+        self.last_update_lbl.config(text=f"Ultimo paquete: {datetime.now().strftime('%H:%M:%S')}")
+
+    # ------------------------------------------------------------------
+    # Redibujo de graficas (mas lento que el drenado de datos)
+    # ------------------------------------------------------------------
+    def _refresh_plots(self):
+        if self.traj_x:
+            self.traj_line.set_data(self.traj_x, self.traj_y)
+            self.traj_point.set_data([self.traj_x[-1]], [self.traj_y[-1]])
+            if self.map_autoscale_var.get():
+                self.ax_traj.relim()
+                self.ax_traj.autoscale_view()
+            else:
+                # Limites fijos (recomendado por la ficha tecnica) para evitar
+                # que el mapa "salte" de zoom en cada iteracion. Si la
+                # trayectoria se sale del rango, lo ampliamos con margen.
+                max_extent = max(abs(v) for v in self.traj_x + self.traj_y) if (self.traj_x or self.traj_y) else 0
+                limit = max(MAP_FIXED_LIMIT_M, max_extent * 1.15)
+                self.ax_traj.set_xlim(-limit, limit)
+                self.ax_traj.set_ylim(-limit, limit)
+            self.canvas_traj.draw_idle()
+
+        if self.time_hist:
+            t = list(self.time_hist)
+            self.line_veld.set_data(t, list(self.veld_hist))
+            self.line_veli.set_data(t, list(self.veli_hist))
+            self.line_yaw.set_data(t, list(self.yaw_hist))
+
+            if self.setpoint_yaw is not None:
+                self.line_yawsp.set_data([t[0], t[-1]], [self.setpoint_yaw, self.setpoint_yaw])
+            if self.setpoint_vel is not None:
+                self.line_velsp.set_data([t[0], t[-1]], [self.setpoint_vel, self.setpoint_vel])
+
+            for ax in (self.ax_vel, self.ax_yaw):
+                ax.relim()
+                ax.autoscale_view()
+            self.canvas_time.draw_idle()
+
+        self.after(PLOT_REFRESH_MS, self._refresh_plots)
+
+    # ------------------------------------------------------------------
+    # Guardar / borrar mapa
+    # ------------------------------------------------------------------
+    def _save_map(self):
+        if not self.traj_x:
+            messagebox.showinfo("Sin datos", "Todavia no hay trayectoria que guardar.")
+            return
+
+        default_name = f"trayectoria_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        path = filedialog.asksaveasfilename(
+            title="Guardar mapa de trayectoria",
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=[("Imagen PNG", "*.png"), ("CSV de puntos", "*.csv")],
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".csv"):
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["X", "Y"])
+                    writer.writerows(zip(self.traj_x, self.traj_y))
+            else:
+                self.fig_traj.savefig(path, facecolor=self.fig_traj.get_facecolor(), dpi=150)
+                # ademas del PNG, guarda automaticamente un CSV junto a el
+                csv_path = os.path.splitext(path)[0] + ".csv"
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["X", "Y"])
+                    writer.writerows(zip(self.traj_x, self.traj_y))
+            messagebox.showinfo("Guardado", f"Mapa guardado en:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error al guardar", str(e))
+
+    def _clear_map(self):
+        if not self.traj_x:
+            return
+        if not messagebox.askyesno("Borrar mapa", "Esto borra la trayectoria mostrada (no afecta al robot). Continuar?"):
+            return
+        self.traj_x.clear()
+        self.traj_y.clear()
+        self.traj_line.set_data([], [])
+        self.traj_point.set_data([], [])
+        if self.map_autoscale_var.get():
+            self.ax_traj.relim()
+            self.ax_traj.autoscale_view()
+        else:
+            self.ax_traj.set_xlim(-MAP_FIXED_LIMIT_M, MAP_FIXED_LIMIT_M)
+            self.ax_traj.set_ylim(-MAP_FIXED_LIMIT_M, MAP_FIXED_LIMIT_M)
+        self.canvas_traj.draw_idle()
+
+    # ------------------------------------------------------------------
+    def _on_close(self):
+        self.client.disconnect()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = RobotDashboard()
+    app.mainloop()
